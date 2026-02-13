@@ -2,10 +2,6 @@
 
 A Flutter-based Android application for mapping MeshCore mesh network coverage in real-time.
 
-## 📥 Downloads
-
-**Latest Release APK:** Available in the [releases](releases/) folder
-
 **Source Code:** [Meshcore-Wardrive-Android-Source](https://github.com/mintylinux/Meshcore-Wardrive-Android-Source)
 
 ## 🚀 Quick Start
