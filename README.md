@@ -159,7 +159,7 @@ For issues and questions:
 
 ---
 
-**Current Version:** 1.0.24
+**Current Version:** 1.0.27
 
 **Minimum Android Version:** Android 5.0 (API 21)
 
