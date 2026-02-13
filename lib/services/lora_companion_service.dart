@@ -144,11 +144,12 @@ class LoRaCompanionService {
 
       final subscription = FlutterBluePlus.scanResults.listen((results) {
         for (ScanResult r in results) {
-          // Look for LoRa/Meshtastic devices
+          // Look for LoRa/Meshtastic/WhisperOS devices
           final name = r.device.platformName.toLowerCase();
           if (name.contains('lora') ||
               name.contains('meshtastic') ||
               name.contains('meshcore') ||
+              name.contains('whisper') ||
               name.contains('t-beam') ||
               name.contains('heltec')) {
             if (!devices.contains(r.device)) {
