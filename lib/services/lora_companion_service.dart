@@ -93,6 +93,11 @@ class LoRaCompanionService {
   final Map<String, DateTime> _lastContactRequestAt = {}; // keyPrefix -> time
   Duration _contactRequestCooldown = const Duration(minutes: 5);
 
+  // Carpeater: cache full 32-byte public keys by prefix (populated from contact frames)
+  final Map<String, Uint8List> _contactPubKeyCache = {};
+  // Carpeater: callback receives (pushCode, frameData) for login + binary responses
+  void Function(int pushCode, Uint8List data)? _carpeaterPayloadCallback;
+
   // Settings
   String? _ignoredRepeaterPrefix;
 
@@ -817,6 +822,8 @@ class LoRaCompanionService {
         break;
       case RESP_CODE_SENT:
         _debugLog.logInfo('✅ Message sent');
+        // Notify carpeater so it can unblock its send-ACK completer
+        _carpeaterPayloadCallback?.call(RESP_CODE_SENT, frame.data);
         break;
       case RESP_CODE_BATT_AND_STORAGE:
         _handleBatteryResponse(frame.data);
@@ -841,6 +848,20 @@ class LoRaCompanionService {
           '🔍 Control data: ${frame.data.take(50).map((b) => b.toRadixString(16).padLeft(2, "0")).join(" ")}',
         );
         _handleControlDataPush(frame.data);
+        break;
+      case PUSH_CODE_LOGIN_SUCCESS:
+        _debugLog.logInfo('Repeater login SUCCESS (0x85)');
+        _carpeaterPayloadCallback?.call(PUSH_CODE_LOGIN_SUCCESS, frame.data);
+        break;
+      case PUSH_CODE_LOGIN_FAIL:
+        _debugLog.logError('Repeater login FAILED (0x86)');
+        _carpeaterPayloadCallback?.call(PUSH_CODE_LOGIN_FAIL, frame.data);
+        break;
+      case PUSH_CODE_BINARY_RESPONSE:
+        _debugLog.logLoRa(
+          'Binary response (0x8C), payload len=${frame.data.length}',
+        );
+        _carpeaterPayloadCallback?.call(PUSH_CODE_BINARY_RESPONSE, frame.data);
         break;
       default:
         // Log other frame types for debugging
@@ -932,6 +953,7 @@ class LoRaCompanionService {
       // Parse the payload as a Discovery response
       final discovery = _protocol.parseDiscoveryResponse(payload);
       if (discovery == null) {
+        // Not a Discovery response — ignore (login/binary responses handled via dedicated push codes)
         _debugLog.logLoRa('Control data is not a Discovery response');
         return;
       }
@@ -1007,6 +1029,9 @@ class LoRaCompanionService {
 
     // Clear from pending
     _pendingContactRequests.remove(contact.publicKeyHex);
+
+    // Cache the full 32-byte public key keyed by prefix (used by Carpeater mode)
+    _contactPubKeyCache[contact.publicKeyPrefix] = contact.publicKey;
 
     // Store node type for filtering
     _nodeTypes[contact.publicKeyPrefix] = contact.advType;
@@ -1387,6 +1412,124 @@ class LoRaCompanionService {
 
   Future<void> disconnectMqtt() async {
     // MQTT removed - no-op
+  }
+
+  // ============================================================================
+  // CARPEATER MODE - PUBLIC METHODS FOR REPEATER CONTROL
+  // ============================================================================
+
+  /// Send a login command to a target repeater
+  /// Returns true if the command was sent successfully
+  /// The response will come through PUSH_CODE_CONTROL_DATA
+  Future<bool> sendRepeaterLogin({
+    required Uint8List targetPubKey,
+    required String password,
+  }) async {
+    if (!isDeviceConnected) {
+      _debugLog.logError('Cannot send login: Device not connected');
+      return false;
+    }
+
+    try {
+      _debugLog.logInfo('Sending login to repeater...');
+      
+      // createLoginPayload embeds [pubkey(32)][password] — ready to send as CMD_SEND_LOGIN
+      final payload = _protocol.createLoginPayload(targetPubKey, password);
+      final cmd = _createCommandForDevice(CMD_SEND_LOGIN, payload);
+      await _sendBinaryToDevice(cmd);
+      
+      _debugLog.logInfo('Login command sent');
+      return true;
+    } catch (e) {
+      _debugLog.logError('Failed to send login: $e');
+      return false;
+    }
+  }
+
+  /// Send a CLI command to a logged-in repeater via CMD_SEND_MESSAGE
+  /// with TXT_TYPE_CLI_DATA.  The repeater executes the command and
+  /// replies with a text message (which we currently don't parse).
+  Future<bool> sendRepeaterCliCommand({
+    required Uint8List targetPubKey,
+    required String command,
+  }) async {
+    if (!isDeviceConnected) {
+      _debugLog.logError('Cannot send CLI command: Device not connected');
+      return false;
+    }
+
+    try {
+      _debugLog.logInfo('Sending CLI command to repeater: $command');
+      final payload = _protocol.createCliCommandPayload(targetPubKey, command);
+      final cmd = _createCommandForDevice(CMD_SEND_MESSAGE, payload);
+      await _sendBinaryToDevice(cmd);
+      _debugLog.logInfo('CLI command sent');
+      return true;
+    } catch (e) {
+      _debugLog.logError('Failed to send CLI command: $e');
+      return false;
+    }
+  }
+
+  /// Request neighbours from a target repeater (requires login first)
+  /// Uses CMD_SEND_BINARY_REQ (50) with REQ_TYPE_GET_NEIGHBOURS payload.
+  /// Response arrives as PUSH_CODE_BINARY_RESPONSE (0x8C).
+  Future<bool> sendRepeaterGetNeighbours({
+    required Uint8List targetPubKey,
+  }) async {
+    if (!isDeviceConnected) {
+      _debugLog.logError('Cannot request neighbours: Device not connected');
+      return false;
+    }
+
+    try {
+      _debugLog.logInfo('Requesting neighbours via CMD_SEND_BINARY_REQ...');
+
+      final requestData = _protocol.createGetNeighboursRequestData();
+      final payload = _protocol.createBinaryReqPayload(targetPubKey, requestData);
+      final cmd = _createCommandForDevice(CMD_SEND_BINARY_REQ, payload);
+      await _sendBinaryToDevice(cmd);
+
+      _debugLog.logInfo('Binary neighbours request sent');
+      return true;
+    } catch (e) {
+      _debugLog.logError('Failed to send binary neighbours request: $e');
+      return false;
+    }
+  }
+
+  /// Get contact info for a specific repeater by ID prefix
+  /// Returns null if not found in cache
+  Repeater? getRepeaterContact(String idPrefix) {
+    final upperPrefix = idPrefix.toUpperCase();
+    for (final entry in _repeaterContactCache.entries) {
+      if (entry.key.toUpperCase().startsWith(upperPrefix)) {
+        return entry.value;
+      }
+    }
+    return null;
+  }
+
+  /// Get all cached repeater contacts
+  Map<String, Repeater> get repeaterContacts => 
+      Map.unmodifiable(_repeaterContactCache);
+
+  /// Get the full 32-byte public key for a contact by its 8-char ID prefix.
+  /// Returns null if the contact hasn't been received yet.
+  Uint8List? getContactPubKey(String prefix) {
+    final upperPrefix = prefix.toUpperCase();
+    for (final entry in _contactPubKeyCache.entries) {
+      if (entry.key.toUpperCase().startsWith(upperPrefix)) {
+        return Uint8List.fromList(entry.value); // defensive copy
+      }
+    }
+    return null;
+  }
+
+  /// Register a callback that receives login (0x85/0x86) and binary response
+  /// (0x8C) push frames for Carpeater mode. Pass null to unregister.
+  void setCarpeaterCallback(void Function(int pushCode, Uint8List data)? callback) {
+    _carpeaterPayloadCallback = callback;
   }
 
   void dispose() {

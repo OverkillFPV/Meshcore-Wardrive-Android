@@ -10,6 +10,7 @@ import '../models/models.dart';
 import '../services/location_service.dart';
 import '../services/aggregation_service.dart';
 import '../services/lora_companion_service.dart';
+import '../services/carpeater_service.dart';
 import '../services/database_service.dart';
 import '../services/upload_service.dart';
 import '../services/settings_service.dart';
@@ -82,6 +83,14 @@ class _MapScreenState extends State<MapScreen> {
   
   // Map rotation lock
   bool _lockRotationNorth = false;
+  
+  // Carpeater mode
+  bool _carpeaterEnabled = false;
+  String? _carpeaterRepeaterId;
+  String? _carpeaterPassword;
+  int _carpeaterInterval = 30;
+  CarpeaterState _carpeaterState = CarpeaterState.disabled;
+  StreamSubscription<CarpeaterState>? _carpeaterStateSubscription;
 
   @override
   void initState() {
@@ -98,6 +107,13 @@ class _MapScreenState extends State<MapScreen> {
     _batterySubscription = loraService.batteryStream.listen((percent) {
       setState(() {
         _batteryPercent = percent;
+      });
+    });
+    
+    // Subscribe to Carpeater state changes
+    _carpeaterStateSubscription = _locationService.carpeaterService.stateStream.listen((state) {
+      setState(() {
+        _carpeaterState = state;
       });
     });
     
@@ -156,6 +172,12 @@ class _MapScreenState extends State<MapScreen> {
     final ignoredPrefix = await _settingsService.getIgnoredRepeaterPrefix();
     final includeOnly = await _settingsService.getIncludeOnlyRepeaters();
     
+    // Load Carpeater settings
+    final carpeaterEnabled = await _settingsService.getCarpeaterEnabled();
+    final carpeaterRepeaterId = await _settingsService.getCarpeaterRepeaterId();
+    final carpeaterPassword = await _settingsService.getCarpeaterPassword();
+    final carpeaterInterval = await _settingsService.getCarpeaterInterval();
+    
     setState(() {
       _showSamples = showSamples;
       _showGpsSamples = showGpsSamples;
@@ -167,11 +189,18 @@ class _MapScreenState extends State<MapScreen> {
       _coveragePrecision = coveragePrecision;
       _ignoredRepeaterPrefix = ignoredPrefix;
       _includeOnlyRepeaters = includeOnly;
+      _carpeaterEnabled = carpeaterEnabled;
+      _carpeaterRepeaterId = carpeaterRepeaterId;
+      _carpeaterPassword = carpeaterPassword;
+      _carpeaterInterval = carpeaterInterval;
     });
     
     // Apply to services
     _locationService.setPingInterval(pingInterval);
     _locationService.loraCompanion.setIgnoredRepeaterPrefix(ignoredPrefix);
+    // Tell the location service whether carpeater mode is configured so it can
+    // suppress direct pings immediately (before the repeater is logged in).
+    _locationService.setCarpeaterMode(carpeaterEnabled);
   }
 
   Future<void> _getCurrentLocation() async {
@@ -228,12 +257,24 @@ class _MapScreenState extends State<MapScreen> {
       if (started) {
         // Auto-enable ping if LoRa is connected
         if (_loraConnected) {
-          _locationService.enableAutoPing();
-          setState(() {
-            _isTracking = true;
-            _autoPingEnabled = true;
-          });
-          _showSnackBar('Location tracking and auto-ping started');
+          if (_carpeaterEnabled) {
+            // Carpeater mode: suppress direct pings, start repeater loop if needed
+            if (_carpeaterState == CarpeaterState.disabled ||
+                _carpeaterState == CarpeaterState.error) {
+              _locationService.carpeaterService.start();
+            }
+            setState(() {
+              _isTracking = true;
+            });
+            _showSnackBar('Location tracking started (carpeater mode active)');
+          } else {
+            _locationService.enableAutoPing();
+            setState(() {
+              _isTracking = true;
+              _autoPingEnabled = true;
+            });
+            _showSnackBar('Location tracking and auto-ping started');
+          }
         } else {
           setState(() {
             _isTracking = true;
@@ -459,6 +500,7 @@ class _MapScreenState extends State<MapScreen> {
     _positionSubscription?.cancel();
     _sampleSavedSubscription?.cancel();
     _pingEventSubscription?.cancel();
+    _carpeaterStateSubscription?.cancel();
     _locationService.dispose();
     super.dispose();
   }
@@ -1327,6 +1369,175 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
+  // ============================================================================
+  // CARPEATER MODE CONFIGURATION
+  // ============================================================================
+
+  Future<void> _configureCarpeaterRepeater() async {
+    // Get available repeaters from contact cache
+    final repeaters = _locationService.loraCompanion.repeaterContacts;
+    final controller = TextEditingController(text: _carpeaterRepeaterId ?? '');
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Target Repeater'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Enter the public key prefix of the repeater you want to log into for Carpeater mode.\n\n'
+              'The repeater must have admin password enabled.',
+              style: TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(
+                labelText: 'Repeater Public Key Prefix',
+                hintText: 'e.g., 7E3A4F...',
+                isDense: true,
+              ),
+              textCapitalization: TextCapitalization.characters,
+            ),
+            if (repeaters.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              const Text('Known repeaters:', style: TextStyle(fontSize: 12)),
+              SizedBox(
+                height: 100,
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: repeaters.length,
+                  itemBuilder: (context, index) {
+                    final entry = repeaters.entries.elementAt(index);
+                    return ListTile(
+                      dense: true,
+                      title: Text(entry.value.name ?? entry.key.substring(0, 8)),
+                      subtitle: Text(entry.key.substring(0, 8)),
+                      onTap: () {
+                        controller.text = entry.key.substring(0, 8);
+                      },
+                    );
+                  },
+                ),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      final repeaterId = controller.text.isEmpty ? null : controller.text.toUpperCase();
+      setState(() {
+        _carpeaterRepeaterId = repeaterId;
+      });
+      await _settingsService.setCarpeaterRepeaterId(repeaterId);
+      _showSnackBar('Carpeater target repeater updated');
+    }
+  }
+
+  Future<void> _configureCarpeaterPassword() async {
+    final controller = TextEditingController(text: _carpeaterPassword ?? '');
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Admin Password'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Enter the admin password for the target repeater.\n\n'
+              'This is the password configured in the repeater\'s firmware.',
+              style: TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(
+                labelText: 'Password',
+                hintText: 'Enter password',
+                isDense: true,
+              ),
+              obscureText: true,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      final password = controller.text.isEmpty ? null : controller.text;
+      setState(() {
+        _carpeaterPassword = password;
+      });
+      await _settingsService.setCarpeaterPassword(password);
+      _showSnackBar('Carpeater password updated');
+    }
+  }
+
+  Future<void> _configureCarpeaterInterval() async {
+    final intervals = [15, 30, 45, 60, 90, 120];
+    
+    final selected = await showDialog<int>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Discovery Interval'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'How often should Carpeater mode request neighbour discovery from the repeater?',
+              style: TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 12),
+            ...intervals.map((interval) => RadioListTile<int>(
+              title: Text('${interval}s'),
+              value: interval,
+              groupValue: _carpeaterInterval,
+              onChanged: (value) => Navigator.pop(context, value),
+            )),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, null),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+
+    if (selected != null) {
+      setState(() {
+        _carpeaterInterval = selected;
+      });
+      await _settingsService.setCarpeaterInterval(selected);
+      _showSnackBar('Carpeater interval: ${selected}s');
+    }
+  }
+
   void _showSettings() {
     showModalBottomSheet(
       context: context,
@@ -1575,6 +1786,72 @@ class _MapScreenState extends State<MapScreen> {
               onTap: () {
                 Navigator.pop(context);
                 _configureUploadUrl();
+              },
+            ),
+            const Divider(),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Text(
+                'Carpeater Mode',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+              ),
+            ),
+            SwitchListTile(
+              title: const Text('Enable Carpeater Mode'),
+              subtitle: Text(_carpeaterState == CarpeaterState.disabled 
+                  ? 'Use a repeater for discovery' 
+                  : 'Status: ${_carpeaterState.name}'),
+              value: _carpeaterEnabled,
+              onChanged: (value) async {
+                setState(() {
+                  _carpeaterEnabled = value;
+                });
+                await _settingsService.setCarpeaterEnabled(value);
+                // Keep the location service flag in sync so direct pings are
+                // suppressed immediately (no race with repeater login).
+                _locationService.setCarpeaterMode(value);
+                if (value && _loraConnected) {
+                  // Carpeater mode on: disable any active direct pings and
+                  // start the repeater discovery loop.
+                  _locationService.disableAutoPing();
+                  _locationService.carpeaterService.start();
+                } else {
+                  // Stop Carpeater mode
+                  _locationService.carpeaterService.stop();
+                }
+                Navigator.pop(context);
+              },
+            ),
+            ListTile(
+              title: const Text('Target Repeater'),
+              subtitle: Text(_carpeaterRepeaterId ?? 'Not configured'),
+              trailing: const Icon(Icons.cell_tower),
+              enabled: !_carpeaterEnabled,
+              onTap: () {
+                Navigator.pop(context);
+                _configureCarpeaterRepeater();
+              },
+            ),
+            ListTile(
+              title: const Text('Admin Password'),
+              subtitle: Text(_carpeaterPassword != null && _carpeaterPassword!.isNotEmpty 
+                  ? '••••••••' 
+                  : 'Not set'),
+              trailing: const Icon(Icons.lock),
+              enabled: !_carpeaterEnabled,
+              onTap: () {
+                Navigator.pop(context);
+                _configureCarpeaterPassword();
+              },
+            ),
+            ListTile(
+              title: const Text('Discovery Interval'),
+              subtitle: Text('${_carpeaterInterval}s'),
+              trailing: const Icon(Icons.timer),
+              enabled: !_carpeaterEnabled,
+              onTap: () {
+                Navigator.pop(context);
+                _configureCarpeaterInterval();
               },
             ),
             const Divider(),

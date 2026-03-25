@@ -121,4 +121,65 @@ class SettingsService {
       await prefs.setString(_includeOnlyRepeatersKey, value);
     }
   }
+  
+  // ============================================================================
+  // CARPEATER MODE SETTINGS
+  // ============================================================================
+  
+  static const String _carpeaterEnabledKey = 'carpeater_enabled';
+  static const String _carpeaterRepeaterIdKey = 'carpeater_repeater_id';
+  static const String _carpeaterPasswordKey = 'carpeater_password';
+  static const String _carpeaterIntervalKey = 'carpeater_interval_seconds';
+  
+  /// Check if Carpeater mode is enabled
+  Future<bool> getCarpeaterEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_carpeaterEnabledKey) ?? false;
+  }
+  
+  Future<void> setCarpeaterEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_carpeaterEnabledKey, value);
+  }
+  
+  /// Get the target repeater ID (public key prefix) for Carpeater mode
+  Future<String?> getCarpeaterRepeaterId() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_carpeaterRepeaterIdKey);
+  }
+  
+  Future<void> setCarpeaterRepeaterId(String? value) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (value == null || value.isEmpty) {
+      await prefs.remove(_carpeaterRepeaterIdKey);
+    } else {
+      await prefs.setString(_carpeaterRepeaterIdKey, value);
+    }
+  }
+  
+  /// Get the admin password for the target repeater
+  Future<String?> getCarpeaterPassword() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_carpeaterPasswordKey);
+  }
+  
+  Future<void> setCarpeaterPassword(String? value) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (value == null || value.isEmpty) {
+      await prefs.remove(_carpeaterPasswordKey);
+    } else {
+      await prefs.setString(_carpeaterPasswordKey, value);
+    }
+  }
+  
+  /// Get the discovery interval for Carpeater mode (seconds between discovery cycles)
+  Future<int> getCarpeaterInterval() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_carpeaterIntervalKey) ?? 30; // Default 30 seconds
+  }
+  
+  Future<void> setCarpeaterInterval(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_carpeaterIntervalKey, value);
+  }
 }

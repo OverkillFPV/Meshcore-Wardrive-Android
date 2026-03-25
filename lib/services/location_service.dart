@@ -6,6 +6,8 @@ import 'package:permission_handler/permission_handler.dart';
 import '../models/models.dart';
 import 'database_service.dart';
 import 'lora_companion_service.dart';
+import 'carpeater_service.dart';
+import 'settings_service.dart';
 import '../utils/geohash_utils.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
@@ -14,12 +16,46 @@ import 'persistent_debug_logger.dart';
 class LocationService {
   final DatabaseService _dbService = DatabaseService();
   final LoRaCompanionService _loraCompanion = LoRaCompanionService();
+  final SettingsService _settingsService = SettingsService();
+  late final CarpeaterService _carpeaterService;
   final PersistentDebugLogger _logger = PersistentDebugLogger();
   StreamSubscription<Position>? _positionStreamSubscription;
+  StreamSubscription<List<Map<String, dynamic>>>? _carpeaterNeighboursSubscription;
+  StreamSubscription<void>? _carpeaterDiscoveryStartedSubscription;
   bool _isTracking = false;
   bool _autoPingEnabled = false;
   double _pingIntervalMeters = 805.0; // Default 0.5 miles
   LatLng? _lastPingPosition;
+  /// Most recent GPS fix — updated on every position event.
+  LatLng? _lastKnownPosition;
+  /// GPS position snapshotted the moment the carpeater discovery advert is
+  /// confirmed sent.  Used instead of _lastKnownPosition so that samples are
+  /// geo-tagged to WHERE the request was physically transmitted, not where the
+  /// phone ends up 30+ seconds later when the results come back.
+  LatLng? _carpeaterDiscoveryPosition;
+
+  /// True when the user has configured carpeater mode.
+  /// Set via [setCarpeaterMode] from the UI. When true, direct zero-hop pings
+  /// are suppressed regardless of the runtime state of the repeater connection.
+  bool _carpeaterModeEnabled = false;
+
+  LocationService() {
+    _carpeaterService = CarpeaterService(_loraCompanion, _settingsService);
+    // Snapshot GPS the moment the discovery advert is confirmed sent so samples
+    // are placed at the transmission location, not where results arrive 30 s later.
+    _carpeaterDiscoveryStartedSubscription =
+        _carpeaterService.discoveryStartedStream.listen((_) {
+      _carpeaterDiscoveryPosition = _lastKnownPosition;
+      _logger.logPingEvent(
+        'Carpeater: snapshotted discovery position at '
+        '${_carpeaterDiscoveryPosition?.latitude}, '
+        '${_carpeaterDiscoveryPosition?.longitude}',
+      );
+    });
+    // Subscribe to carpeater neighbour results and persist them as samples.
+    _carpeaterNeighboursSubscription =
+        _carpeaterService.neighboursStream.listen(_onCarpeaterNeighbours);
+  }
   
   // Stream for broadcasting current position
   final _currentPositionController = StreamController<LatLng>.broadcast();
@@ -190,6 +226,9 @@ class LocationService {
   /// Get LoRa companion service
   LoRaCompanionService get loraCompanion => _loraCompanion;
 
+  /// Get Carpeater service
+  CarpeaterService get carpeaterService => _carpeaterService;
+
   /// Enable auto-ping (requires LoRa device to be connected)
   void enableAutoPing() {
     final isConnected = _loraCompanion.isDeviceConnected;
@@ -208,6 +247,14 @@ class LocationService {
   void disableAutoPing() {
     _autoPingEnabled = false;
     _logger.logPingEvent('Auto-ping disabled');
+  }
+
+  /// Enable or disable carpeater-only mode.
+  /// When [enabled] is true, direct zero-hop pings are permanently suppressed
+  /// and the remote repeater loop handles all node discovery.
+  void setCarpeaterMode(bool enabled) {
+    _carpeaterModeEnabled = enabled;
+    _logger.logPingEvent('Carpeater mode ${enabled ? "enabled" : "disabled"} — direct pings ${enabled ? "suppressed" : "allowed"}');
   }
 
   /// Check if auto-ping is enabled
@@ -229,7 +276,10 @@ class LocationService {
   void _handleNewPosition(Position position) async {
     final latLng = LatLng(position.latitude, position.longitude);
     await _logger.logLocationEvent('GPS update: ${latLng.latitude}, ${latLng.longitude}, accuracy: ${position.accuracy}m');
-    
+
+    // Always keep the latest position so carpeater results can be geo-tagged
+    _lastKnownPosition = latLng;
+
     // Broadcast current position to listeners
     _currentPositionController.add(latLng);
 
@@ -247,13 +297,18 @@ class LocationService {
 
     // Check if we should trigger a ping (but don't wait for it)
     final isConnected = _loraCompanion.isDeviceConnected;
-    
+
     // Log detailed debug info on every GPS update when auto-ping is enabled
     if (_autoPingEnabled) {
       await _logger.logPingEvent('Checking ping condition: autoPing=$_autoPingEnabled, deviceConnected=$isConnected, lastPingPos=${_lastPingPosition != null ? "set" : "null"}');
     }
-    
-    if (_autoPingEnabled && isConnected) {
+
+    // When carpeater mode is configured the remote repeater handles all
+    // discovery.  Never send a direct zero-hop advert — this flag is set from
+    // the user's saved setting so it is already true before the repeater
+    // connection is established (avoids the race where the first GPS fix fires
+    // before the carpeater service finishes logging in).
+    if (_autoPingEnabled && isConnected && !_carpeaterModeEnabled) {
       bool shouldPing = false;
       
       if (_lastPingPosition == null) {
@@ -319,6 +374,83 @@ class LocationService {
     }
   }
   
+  /// Called whenever the carpeater service delivers a fresh neighbour list.
+  /// Each neighbour is saved as a ping-success sample at the current GPS position.
+  void _onCarpeaterNeighbours(List<Map<String, dynamic>> neighbours) async {
+    // Use the position snapshotted when the discovery advert was sent, falling
+    // back to the latest known position if the snapshot is somehow missing.
+    final pos = _carpeaterDiscoveryPosition ?? _lastKnownPosition;
+    if (pos == null) {
+      _logger.logError('Carpeater', 'Received neighbours but no GPS fix yet — skipping');
+      return;
+    }
+
+    final geohash = GeohashUtils.sampleKey(pos.latitude, pos.longitude);
+
+    if (neighbours.isEmpty) {
+      // No nodes heard — save a failed sample (dead zone) so the map colours
+      // this area red, matching the behaviour of a timed-out direct ping.
+      _logger.logPingEvent(
+        'Carpeater: no neighbours — saving failed sample at '
+        '${pos.latitude}, ${pos.longitude}',
+      );
+      final sample = Sample(
+        id: _generateUniqueId(),
+        position: pos,
+        timestamp: DateTime.now(),
+        path: null,
+        geohash: geohash,
+        rssi: null,
+        snr: null,
+        pingSuccess: false,
+      );
+      try {
+        await _dbService.insertSample(sample);
+      } catch (e) {
+        _logger.logError('Carpeater save', e.toString());
+      }
+      _sampleSavedController.add(null);
+      return;
+    }
+    _logger.logPingEvent(
+      'Carpeater: saving ${neighbours.length} neighbour sample(s) '
+      'at ${pos.latitude}, ${pos.longitude}',
+    );
+
+    for (final n in neighbours) {
+      // 16-char hex from 8-byte prefix → truncate to 8 chars to match repeater.id
+      final rawPubkey = n['pubkey'] as String? ?? '';
+      final repeaterId = rawPubkey.length >= 8
+          ? rawPubkey.substring(0, 8).toUpperCase()
+          : rawPubkey.toUpperCase();
+
+      final snrRaw = n['snr']; // double from parseBinaryResponseNeighbours
+      final snrInt = snrRaw is double
+          ? snrRaw.round()
+          : (snrRaw is int ? snrRaw : null);
+
+      final sample = Sample(
+        id: _generateUniqueId(),
+        position: pos,
+        timestamp: DateTime.now(),
+        path: repeaterId,   // matches Repeater.id (8-char hex prefix)
+        geohash: geohash,
+        rssi: null,         // not provided in neighbour list
+        snr: snrInt,
+        pingSuccess: true,
+      );
+      try {
+        await _dbService.insertSample(sample);
+        _logger.logPingEvent('  → saved sample for $repeaterId (SNR=$snrInt)');
+      } catch (e) {
+        _logger.logError('Carpeater save', e.toString());
+      }
+    }
+
+    // Notify map to reload once after all samples are written
+    _sampleSavedController.add(null);
+  }
+
   /// Perform ping in background and update sample when complete
   void _performPingInBackground(LatLng latLng, String geohash) async {
     try {
@@ -454,10 +586,15 @@ class LocationService {
   /// Dispose resources
   void dispose() {
     stopTracking();
+    _carpeaterNeighboursSubscription?.cancel();
+    _carpeaterNeighboursSubscription = null;
+    _carpeaterDiscoveryStartedSubscription?.cancel();
+    _carpeaterDiscoveryStartedSubscription = null;
     _logger.close();
     _currentPositionController.close();
     _sampleSavedController.close();
     _pingEventController.close();
+    _carpeaterService.dispose();
     _loraCompanion.dispose();
   }
 }

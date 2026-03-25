@@ -21,7 +21,13 @@ const int CMD_ADD_UPDATE_CONTACT = 9;
 const int CMD_REMOVE_CONTACT = 15;
 const int CMD_SET_NAME = 19;
 const int CMD_SET_POSITION = 20;
+const int CMD_GET_BATT_AND_STORAGE = 20;  // CMD_GET_BATTERY_VOLTAGE
+const int CMD_SEND_LOGIN = 26;  // Send login to repeater/room server
+const int CMD_SEND_STATUS_REQ = 27;  // Send status/data request after login
+const int CMD_GET_CONTACT_BY_KEY = 30;  // Get contact by public key
+const int CMD_SEND_BINARY_REQ = 50;  // Send arbitrary binary request to a contact
 const int CMD_SEND_CONTROL_DATA = 55;
+const int CMD_SEND_ANON_REQ = 57;  // Send anonymous request (for basic info)
 
 // Response codes (radio -> app)
 const int RESP_CODE_OK = 0;
@@ -41,22 +47,52 @@ const int RESP_CODE_BATT_AND_STORAGE = 12;
 
 // Push codes (radio -> app, unsolicited)
 const int PUSH_CODE_ADVERT = 0x80;
-const int PUSH_CODE_NEW_CONTACT = 0x81;
-const int PUSH_CODE_CONTACT_UPDATED = 0x82;
+const int PUSH_CODE_PATH_UPDATED = 0x81;      // was wrongly named NEW_CONTACT
+const int PUSH_CODE_SEND_CONFIRMED = 0x82;    // was wrongly named CONTACT_UPDATED
 const int PUSH_CODE_MSG_WAITING = 0x83;
-const int PUSH_CODE_ACK_RECV = 0x84;
-const int PUSH_CODE_CHANNEL_MSG_RECV = 0x85;
-const int PUSH_CODE_CHANNEL_ECHO = 0x88;  // Channel message echo/repeat (136 decimal)
-const int PUSH_CODE_CONTROL_DATA = 0x8E;  // Control data packet received (142 decimal)
+const int PUSH_CODE_RAW_DATA = 0x84;          // was wrongly named ACK_RECV
+const int PUSH_CODE_LOGIN_SUCCESS = 0x85;     // Login to repeater succeeded
+const int PUSH_CODE_LOGIN_FAIL = 0x86;        // Login to repeater failed
+const int PUSH_CODE_STATUS_RESPONSE = 0x87;   // Response to CMD_SEND_STATUS_REQ
+const int PUSH_CODE_LOG_RX_DATA = 0x88;       // was wrongly named CHANNEL_ECHO
+const int PUSH_CODE_TRACE_DATA = 0x89;
+const int PUSH_CODE_NEW_ADVERT = 0x8A;
+const int PUSH_CODE_TELEMETRY_RESPONSE = 0x8B;
+const int PUSH_CODE_BINARY_RESPONSE = 0x8C;   // Response to CMD_SEND_BINARY_REQ
+const int PUSH_CODE_PATH_DISCOVERY_RESPONSE = 0x8D;
+const int PUSH_CODE_CONTROL_DATA = 0x8E;      // Control data packet received
+const int PUSH_CODE_CONTACT_DELETED = 0x8F;
+const int PUSH_CODE_CONTACTS_FULL = 0x90;
+
+// Legacy aliases — kept so existing handlers still compile
+const int PUSH_CODE_NEW_CONTACT = PUSH_CODE_PATH_UPDATED;      // 0x81
+const int PUSH_CODE_CONTACT_UPDATED = PUSH_CODE_SEND_CONFIRMED; // 0x82
+const int PUSH_CODE_ACK_RECV = PUSH_CODE_RAW_DATA;              // 0x84
+const int PUSH_CODE_CHANNEL_ECHO = PUSH_CODE_LOG_RX_DATA;       // 0x88
 
 // Advertisement types
 const int ADV_TYPE_CHAT = 1;
 const int ADV_TYPE_REPEATER = 2;
 const int ADV_TYPE_ROOM_SERVER = 3;
 
+// Text message types (CMD_SEND_MESSAGE txt_type field)
+const int TXT_TYPE_PLAIN = 0;
+const int TXT_TYPE_CLI_DATA = 1;
+
 // Control data sub-types
 const int CONTROL_SUBTYPE_DISCOVER_REQ = 0x8;
 const int CONTROL_SUBTYPE_DISCOVER_RESP = 0x9;
+
+// Repeater request types (used with CMD_SEND_STATUS_REQ after login)
+const int REQ_TYPE_GET_STATUS = 0x01;
+const int REQ_TYPE_KEEP_ALIVE = 0x02;
+const int REQ_TYPE_GET_TELEMETRY_DATA = 0x03;
+const int REQ_TYPE_GET_ACCESS_LIST = 0x05;
+const int REQ_TYPE_GET_NEIGHBOURS = 0x06;
+const int REQ_TYPE_GET_OWNER_INFO = 0x07;
+
+// Repeater response for login
+const int RESP_SERVER_LOGIN_OK = 0;
 
 class MeshCoreFrame {
   final int code;
@@ -745,5 +781,438 @@ class MeshCoreProtocol {
       print('Error parsing discovery response: $e');
       return null;
     }
+  }
+
+  // ============================================================================
+  // CARPEATER MODE - Repeater login and neighbor operations
+  // ============================================================================
+
+  /// Create CMD_SEND_LOGIN payload to authenticate with a repeater
+  /// recipientPubKey: 32-byte public key of the repeater
+  /// password: admin password (max 15 chars)
+  /// Returns payload for CMD_SEND_LOGIN command
+  Uint8List createLoginPayload(Uint8List recipientPubKey, String password) {
+    if (recipientPubKey.length != 32) {
+      throw ArgumentError('Recipient public key must be 32 bytes');
+    }
+    
+    final payload = BytesBuilder();
+    
+    // Recipient public key (32 bytes)
+    payload.add(recipientPubKey);
+    
+    // Password (max 15 chars, will be null-terminated in firmware)
+    final pwdBytes = password.codeUnits;
+    final pwdLen = pwdBytes.length > 15 ? 15 : pwdBytes.length;
+    for (int i = 0; i < pwdLen; i++) {
+      payload.addByte(pwdBytes[i]);
+    }
+    
+    return payload.toBytes();
+  }
+
+  /// Create CMD_SEND_STATUS_REQ payload to request data from logged-in repeater
+  /// recipientPubKey: 32-byte public key of the repeater
+  /// requestType: REQ_TYPE_* constant (e.g., REQ_TYPE_GET_NEIGHBOURS)
+  /// Returns payload for CMD_SEND_STATUS_REQ command
+  Uint8List createStatusRequestPayload(Uint8List recipientPubKey, int requestType, {Uint8List? extraData}) {
+    if (recipientPubKey.length != 32) {
+      throw ArgumentError('Recipient public key must be 32 bytes');
+    }
+    
+    final payload = BytesBuilder();
+    
+    // Recipient public key (32 bytes)
+    payload.add(recipientPubKey);
+    
+    // Request type (1 byte)
+    payload.addByte(requestType);
+    
+    // Extra data if provided
+    if (extraData != null) {
+      payload.add(extraData);
+    }
+    
+    return payload.toBytes();
+  }
+
+  /// Create GET_NEIGHBOURS request payload
+  /// Format: [version=0] [count] [offset(2)] [order_by] [pubkey_prefix_length] [random(4)]
+  /// Returns extra data to append to createStatusRequestPayload
+  Uint8List createGetNeighboursExtraData({
+    int count = 32,
+    int offset = 0,
+    int orderBy = 0, // 0=newest, 1=oldest, 2=strongest, 3=weakest
+    int pubkeyPrefixLength = 8,
+  }) {
+    final data = BytesBuilder();
+    
+    // Version (1 byte) - must be 0
+    data.addByte(0);
+    
+    // Count (1 byte) - how many to fetch
+    data.addByte(count);
+    
+    // Offset (2 bytes LE)
+    data.addByte(offset & 0xFF);
+    data.addByte((offset >> 8) & 0xFF);
+    
+    // Order by (1 byte)
+    data.addByte(orderBy);
+    
+    // Public key prefix length (1 byte)
+    data.addByte(pubkeyPrefixLength);
+    
+    // Random bytes for packet uniqueness (4 bytes)
+    final random = DateTime.now().millisecondsSinceEpoch;
+    data.addByte(random & 0xFF);
+    data.addByte((random >> 8) & 0xFF);
+    data.addByte((random >> 16) & 0xFF);
+    data.addByte((random >> 24) & 0xFF);
+    
+    return data.toBytes();
+  }
+
+  /// Create CMD_SEND_BINARY_REQ payload.
+  /// Format: [pubkey(32)][requestData...]
+  /// requestData for neighbours:  [REQ_TYPE(1)][version(1)][count(1)][offset(2)][order(1)][prefix_len(1)][random(4)]
+  Uint8List createBinaryReqPayload(Uint8List recipientPubKey, Uint8List requestData) {
+    if (recipientPubKey.length != 32) {
+      throw ArgumentError('Recipient public key must be 32 bytes');
+    }
+    final payload = BytesBuilder();
+    payload.add(recipientPubKey);
+    payload.add(requestData);
+    return payload.toBytes();
+  }
+
+  /// Create CMD_SEND_MESSAGE payload for a CLI command to a logged-in repeater.
+  /// Serial frame: [CMD=0x02][txt_type(1)][attempt(1)][timestamp(4 LE)][pubkey_prefix(6)][text...]
+  /// We send txt_type = TXT_TYPE_CLI_DATA (1) so the repeater treats it as a
+  /// command and does NOT send an ACK frame (which would clutter our handler).
+  Uint8List createCliCommandPayload(Uint8List recipientPubKey, String command) {
+    if (recipientPubKey.length < 6) {
+      throw ArgumentError('Recipient public key must be at least 6 bytes');
+    }
+    final payload = BytesBuilder();
+    // txt_type = CLI
+    payload.addByte(TXT_TYPE_CLI_DATA);
+    // attempt = 0
+    payload.addByte(0);
+    // timestamp (4 bytes LE) — use current epoch seconds
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    payload.addByte(ts & 0xFF);
+    payload.addByte((ts >> 8) & 0xFF);
+    payload.addByte((ts >> 16) & 0xFF);
+    payload.addByte((ts >> 24) & 0xFF);
+    // first 6 bytes of recipient public key
+    payload.add(recipientPubKey.sublist(0, 6));
+    // command text
+    payload.add(Uint8List.fromList(command.codeUnits));
+    return payload.toBytes();
+  }
+
+  /// Build the inner request data for a GET_NEIGHBOURS binary request.
+  /// Format: [REQ_TYPE_GET_NEIGHBOURS(1)][version(1)][count(1)][offset(2 LE)]
+  ///         [order_by(1)][pubkey_prefix_length(1)][random(4)]
+  Uint8List createGetNeighboursRequestData({
+    int count = 32,
+    int offset = 0,
+    int orderBy = 0,
+    int pubkeyPrefixLength = 8,
+  }) {
+    final data = BytesBuilder();
+    data.addByte(REQ_TYPE_GET_NEIGHBOURS); // 0x06
+    data.addByte(0); // version = 0
+    data.addByte(count);
+    data.addByte(offset & 0xFF);
+    data.addByte((offset >> 8) & 0xFF);
+    data.addByte(orderBy);
+    data.addByte(pubkeyPrefixLength);
+    // 4 random bytes for packet uniqueness
+    final rnd = DateTime.now().millisecondsSinceEpoch;
+    data.addByte(rnd & 0xFF);
+    data.addByte((rnd >> 8) & 0xFF);
+    data.addByte((rnd >> 16) & 0xFF);
+    data.addByte((rnd >> 24) & 0xFF);
+    return data.toBytes();
+  }
+
+  /// Parse a PUSH_CODE_LOGIN_SUCCESS (0x85) frame.data
+  /// Frame data: [is_admin(1)][pubkey_prefix(6)][server_timestamp(4)][acl_perms(1)][fw_ver(1)]
+  /// Returns map with 'success', 'is_admin', 'permissions', 'firmware_version'
+  Map<String, dynamic>? parseLoginSuccessPush(Uint8List data) {
+    try {
+      if (data.length < 7) {
+        print('⚠️ Login success push too short: ${data.length} bytes');
+        return null;
+      }
+      int offset = 0;
+      final isAdmin = data[offset++] != 0;
+      // pubkey prefix (6 bytes) — informational
+      final pubkeyPrefix = data.sublist(offset, offset + 6);
+      offset += 6;
+
+      int? serverTimestamp;
+      int permissions = 0;
+      int? firmwareVersion;
+      if (data.length >= 14) {
+        serverTimestamp = data[offset] |
+            (data[offset + 1] << 8) |
+            (data[offset + 2] << 16) |
+            (data[offset + 3] << 24);
+        offset += 4;
+        permissions = data[offset++];
+        firmwareVersion = data[offset++];
+      }
+
+      return {
+        'success': true,
+        'is_admin': isAdmin,
+        'pubkey_prefix': pubkeyPrefix
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join('')
+            .toUpperCase(),
+        'timestamp': serverTimestamp,
+        'permissions': permissions,
+        'firmware_version': firmwareVersion,
+      };
+    } catch (e) {
+      print('Error parsing login success push: $e');
+      return null;
+    }
+  }
+
+  /// Parse a PUSH_CODE_LOGIN_FAIL (0x86) frame.data
+  /// Frame data: [reserved(1)][pubkey_prefix(6)]
+  Map<String, dynamic> parseLoginFailPush(Uint8List data) {
+    String? prefix;
+    if (data.length >= 7) {
+      prefix = data
+          .sublist(1, 7)
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join('')
+          .toUpperCase();
+    }
+    return {'success': false, 'error_code': 'rejected', 'pubkey_prefix': prefix};
+  }
+
+  /// Parse a PUSH_CODE_BINARY_RESPONSE (0x8C) frame.data that contains
+  /// a GET_NEIGHBOURS reply from the repeater.
+  /// Frame data: [reserved(1)][tag(4)][total_count(2)][result_count(2)][entries...]
+  /// Each entry: [pubkey_prefix(N)][heard_seconds_ago(4 LE)][snr(1 signed x4)]
+  Map<String, dynamic>? parseBinaryResponseNeighbours(Uint8List data, int pubkeyPrefixLength) {
+    try {
+      // Need at least: reserved(1) + tag(4) + total(2) + results(2) = 9
+      if (data.length < 9) {
+        print('⚠️ Binary response too short for neighbours: ${data.length} bytes');
+        return null;
+      }
+
+      int offset = 0;
+      offset++; // reserved
+      final tag = data[offset] |
+          (data[offset + 1] << 8) |
+          (data[offset + 2] << 16) |
+          (data[offset + 3] << 24);
+      offset += 4;
+
+      final totalCount = data[offset] | (data[offset + 1] << 8);
+      offset += 2;
+      final resultCount = data[offset] | (data[offset + 1] << 8);
+      offset += 2;
+
+      final neighbours = <Map<String, dynamic>>[];
+      final entrySize = pubkeyPrefixLength + 4 + 1;
+
+      for (int i = 0; i < resultCount && offset + entrySize <= data.length; i++) {
+        final pubkeyBytes = data.sublist(offset, offset + pubkeyPrefixLength);
+        final pubkey = pubkeyBytes
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join('')
+            .toUpperCase();
+        offset += pubkeyPrefixLength;
+
+        final heardSecondsAgo = data[offset] |
+            (data[offset + 1] << 8) |
+            (data[offset + 2] << 16) |
+            (data[offset + 3] << 24);
+        offset += 4;
+
+        int snrRaw = data[offset++];
+        if (snrRaw > 127) snrRaw -= 256;
+        final snr = snrRaw / 4.0;
+
+        neighbours.add({
+          'pubkey': pubkey,
+          'pubkey_bytes': Uint8List.fromList(pubkeyBytes),
+          'heard_seconds_ago': heardSecondsAgo,
+          'snr': snr,
+        });
+      }
+
+      return {
+        'tag': tag,
+        'total_count': totalCount,
+        'result_count': resultCount,
+        'neighbours': neighbours,
+      };
+    } catch (e) {
+      print('Error parsing binary response neighbours: $e');
+      return null;
+    }
+  }
+
+  /// Parse login response from repeater
+  /// Returns map with 'success', 'is_admin', 'permissions', 'firmware_version'
+  Map<String, dynamic>? parseLoginResponse(Uint8List data) {
+    try {
+      // Login response format:
+      // [timestamp(4)] [resp_code(1)] [keep_alive(1)] [is_admin(1)] [permissions(1)] [random(4)] [fw_ver(1)]
+      if (data.length < 9) {
+        print('⚠️ Login response too short: ${data.length} bytes');
+        return null;
+      }
+      
+      int offset = 0;
+      
+      // Timestamp (4 bytes) - server's timestamp
+      final timestamp = data[offset] |
+          (data[offset + 1] << 8) |
+          (data[offset + 2] << 16) |
+          (data[offset + 3] << 24);
+      offset += 4;
+      
+      // Response code (1 byte) - 0 = login OK
+      final respCode = data[offset++];
+      
+      if (respCode != RESP_SERVER_LOGIN_OK) {
+        return {'success': false, 'error_code': respCode};
+      }
+      
+      // Keep-alive interval (1 byte) - legacy, ignored
+      offset++;
+      
+      // Is admin (1 byte)
+      final isAdmin = data[offset++] != 0;
+      
+      // Permissions (1 byte)
+      final permissions = data[offset++];
+      
+      // Skip random bytes (4 bytes)
+      offset += 4;
+      
+      // Firmware version (1 byte) - if present
+      int? firmwareVersion;
+      if (data.length > offset) {
+        firmwareVersion = data[offset];
+      }
+      
+      return {
+        'success': true,
+        'timestamp': timestamp,
+        'is_admin': isAdmin,
+        'permissions': permissions,
+        'firmware_version': firmwareVersion,
+      };
+    } catch (e) {
+      print('Error parsing login response: $e');
+      return null;
+    }
+  }
+
+  /// Parse GET_NEIGHBOURS response from repeater
+  /// Returns map with 'total_count', 'result_count', 'neighbours' (list of neighbor info)
+  Map<String, dynamic>? parseNeighboursResponse(Uint8List data, int pubkeyPrefixLength) {
+    try {
+      // Response format:
+      // [timestamp(4)] [total_count(2)] [result_count(2)] [neighbour_entries...]
+      // Each neighbour entry: [pubkey_prefix(N)] [heard_seconds_ago(4)] [snr(1)]
+      if (data.length < 8) {
+        print('⚠️ Neighbours response too short: ${data.length} bytes');
+        return null;
+      }
+      
+      int offset = 0;
+      
+      // Timestamp (4 bytes)
+      final timestamp = data[offset] |
+          (data[offset + 1] << 8) |
+          (data[offset + 2] << 16) |
+          (data[offset + 3] << 24);
+      offset += 4;
+      
+      // Total neighbour count (2 bytes LE)
+      final totalCount = data[offset] | (data[offset + 1] << 8);
+      offset += 2;
+      
+      // Result count (2 bytes LE)
+      final resultCount = data[offset] | (data[offset + 1] << 8);
+      offset += 2;
+      
+      // Parse neighbour entries
+      final neighbours = <Map<String, dynamic>>[];
+      final entrySize = pubkeyPrefixLength + 4 + 1; // pubkey + heard_secs_ago + snr
+      
+      for (int i = 0; i < resultCount && offset + entrySize <= data.length; i++) {
+        // Pubkey prefix
+        final pubkeyBytes = data.sublist(offset, offset + pubkeyPrefixLength);
+        final pubkey = pubkeyBytes
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join('')
+            .toUpperCase();
+        offset += pubkeyPrefixLength;
+        
+        // Heard seconds ago (4 bytes LE)
+        final heardSecondsAgo = data[offset] |
+            (data[offset + 1] << 8) |
+            (data[offset + 2] << 16) |
+            (data[offset + 3] << 24);
+        offset += 4;
+        
+        // SNR (1 byte, signed, multiplied by 4)
+        int snrRaw = data[offset++];
+        if (snrRaw > 127) snrRaw -= 256;
+        final snr = snrRaw / 4.0;
+        
+        neighbours.add({
+          'pubkey': pubkey,
+          'pubkey_bytes': Uint8List.fromList(pubkeyBytes),
+          'heard_seconds_ago': heardSecondsAgo,
+          'snr': snr,
+        });
+      }
+      
+      return {
+        'timestamp': timestamp,
+        'total_count': totalCount,
+        'result_count': resultCount,
+        'neighbours': neighbours,
+      };
+    } catch (e) {
+      print('Error parsing neighbours response: $e');
+      return null;
+    }
+  }
+
+  /// Create CLI command payload for sending via control data
+  /// This can be used to send commands like "clear neighbors" via the CLI interface
+  /// Note: This requires admin login first
+  Uint8List createCLICommandPayload(Uint8List recipientPubKey, String command) {
+    if (recipientPubKey.length != 32) {
+      throw ArgumentError('Recipient public key must be 32 bytes');
+    }
+    
+    final payload = BytesBuilder();
+    
+    // Recipient public key (32 bytes)
+    payload.add(recipientPubKey);
+    
+    // Command text (null-terminated)
+    final cmdBytes = command.codeUnits;
+    payload.add(Uint8List.fromList(cmdBytes));
+    payload.addByte(0); // Null terminator
+    
+    return payload.toBytes();
   }
 }
